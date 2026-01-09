@@ -367,35 +367,81 @@ class BlobField(models.JSONField):
         # Track clean state per-instance for Django 6.0+ compatibility.
         # Django 6.0+ calls pre_save() twice during a single save operation
         # (due to RETURNING clause support). This flag prevents double-cleaning.
-        # The flag persists on the instance object until explicitly cleared or
-        # until refresh_from_db() is called.
+        # We also track the value that was cleaned, so we can detect new save operations
+        # with different values (important when on_commit is mocked in tests).
         clean_flag_attr = f"_blobfield_clean_called_{self.attname}"
+        clean_value_attr = f"_blobfield_clean_value_{self.attname}"
         clean_already_called = getattr(model_instance, clean_flag_attr, False)
+
+        # If the flag is set but the value has changed, this is a NEW save operation.
+        # Clear the flag to allow cleaning. This handles the case where on_commit
+        # callbacks don't run (e.g., when mocked in tests).
+        if clean_already_called:
+            previous_value = getattr(model_instance, clean_value_attr, None)
+            if value != previous_value:
+                clean_already_called = False
+                if hasattr(model_instance, clean_flag_attr):
+                    delattr(model_instance, clean_flag_attr)
+                if hasattr(model_instance, clean_value_attr):
+                    delattr(model_instance, clean_value_attr)
+
+        # Store the original value before cleaning for comparison in future pre_save calls
+        original_value = value
 
         if not self._cleaned and not clean_already_called and not self._is_already_cleaned(value):
             value = self.clean(value, model_instance, skip_validation=True)
             # Update instance with cleaned value to prevent re-cleaning on
             # Django 6.0's second pre_save call
             setattr(model_instance, self.attname, value)
-            # Mark as cleaned for this save operation
+            # Mark as cleaned for this save operation and store the original value
             setattr(model_instance, clean_flag_attr, True)
+            setattr(model_instance, clean_value_attr, original_value)
+
+        # Helper to wrap callbacks with flag cleanup for Django 6.0 compatibility.
+        # The flag must persist across pre_save calls (Django 6.0 calls pre_save twice)
+        # but be cleared after the transaction commits for subsequent saves.
+        def wrap_callback_with_flag_cleanup(
+            callback, instance=model_instance, flag_attr=clean_flag_attr, value_attr=clean_value_attr
+        ):
+            def wrapped():
+                try:
+                    return callback()
+                finally:
+                    if hasattr(instance, flag_attr):
+                        delattr(instance, flag_attr)
+                    if hasattr(instance, value_attr):
+                        delattr(instance, value_attr)
+
+            return wrapped
+
+        # Track whether we registered any callbacks this pre_save call
+        registered_callback = False
 
         if self._on_commit_blank is not None:
-            transaction.on_commit(self._on_commit_blank)
+            transaction.on_commit(wrap_callback_with_flag_cleanup(self._on_commit_blank))
             self._on_commit_blank = None
+            registered_callback = True
 
         if self._on_commit_valid is not None:
-            transaction.on_commit(self._on_commit_valid)
+            transaction.on_commit(wrap_callback_with_flag_cleanup(self._on_commit_valid))
             self._on_commit_valid = None
+            registered_callback = True
 
         # Reset the spaghetti used for meeting all django's awkward flows
         self._cleaned = False
         self._validated = False
         self._on_commit_blank = None
         self._on_commit_valid = None
-        # Note: We do NOT clear clean_flag_attr here because Django 6.0+ calls
-        # pre_save twice per save. The flag will be cleared on the next
-        # refresh_from_db() or when a new form is created for the instance.
+
+        # Clear the per-instance flags if we didn't register any callbacks.
+        # When callbacks are registered, they'll clear the flags on commit.
+        # But if no callbacks were registered (e.g., Django 6.0's second pre_save),
+        # we clear the flags now to allow subsequent saves to trigger clean().
+        if not registered_callback:
+            if hasattr(model_instance, clean_flag_attr):
+                delattr(model_instance, clean_flag_attr)
+            if hasattr(model_instance, clean_value_attr):
+                delattr(model_instance, clean_value_attr)
 
         return value
 
