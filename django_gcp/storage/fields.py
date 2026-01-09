@@ -340,9 +340,12 @@ class BlobField(models.JSONField):
         """Check if a value has already been cleaned and should not be cleaned again.
 
         This is needed for Django 6.0+ which calls pre_save() twice during a single
-        save operation (due to RETURNING clause support). We need to detect when the
-        value has already been transformed from {"_tmp_path": ..., "name": ...} to
-        {"path": ...} format to avoid double-cleaning.
+        save operation due to the RETURNING clause support for refreshing fields
+        assigned with expressions. See:
+        https://github.com/django/django/commit/94680437a45a71c70ca8bd2e68b72aa1e2eff337
+
+        We need to detect when the value has already been transformed from
+        {"_tmp_path": ..., "name": ...} to {"path": ...} format to avoid double-cleaning.
 
         Blank values (None or empty dict) return False to ensure clean() is called
         and on_commit callbacks are properly registered.
@@ -641,30 +644,13 @@ class BlobField(models.JSONField):
         return existing_path is not None and instance_path is not None and instance_path != existing_path
 
     def _get_signed_ingress_url(self):
-        """Return a signed URL for uploading a blob to the temporary_path.
-
-        If credentials are not available (e.g., during testing or development),
-        returns None rather than raising an exception. This allows forms to be
-        defined and loaded even without GCP credentials.
-        """
-        try:
-            return get_signed_upload_url(
-                self.storage.bucket,
-                self._get_temporary_path(),
-                content_type="application/octet-stream",
-                max_size_bytes=self.max_size_bytes,
-            )
-        except (AttributeError, Exception) as e:
-            # Handle missing credentials gracefully
-            # This can happen during testing or when forms are loaded at startup
-            if "private key" in str(e) or "credentials" in str(e).lower():
-                logger.warning(
-                    "Could not generate signed ingress URL: %s. "
-                    "Upload functionality will not work without valid credentials.",
-                    e,
-                )
-                return None
-            raise
+        """Return a signed URL for uploading a blob to the temporary_path"""
+        return get_signed_upload_url(
+            self.storage.bucket,
+            self._get_temporary_path(),
+            content_type="application/octet-stream",
+            max_size_bytes=self.max_size_bytes,
+        )
 
     def _get_temporary_path(self):
         """Return a temporary path to which a blob can be uploaded before renaming"""
